@@ -3,7 +3,8 @@ import threading
 import math
 import subprocess
 import numpy as np
-from ... import settings
+from eugene import settings
+import logging
 
 param_dict = {
     "binary_classification": 0, 
@@ -119,8 +120,17 @@ def fit(
     log_dir=None,
     name="seqs",
     prefix="",
-    suffix=""
+    suffix="",
+    logger=None,
+    **kwargs
 ):
+    if logger is None:
+        logging.basicConfig(
+            format='%(asctime)s %(levelname)-8s %(message)s',
+            level=verbosity_dict[verbosity],
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        logger = logging.getLogger(__name__)
     data_dir = data_dir if data_dir is not None else settings.dataset_dir
     log_dir = log_dir if log_dir is not None else settings.logging_dir
     os.makedirs(log_dir) if not os.path.exists(log_dir) else None
@@ -140,13 +150,16 @@ def fit(
         else:
             file1_name = os.path.join(data_dir, f"{name}.fasta")
             file2_name = os.path.join(data_dir, f"{name}.targets")
-    if os.path.exists(file1_name) and os.path.exists(file2_name):
-        print("Train files already exist, skipping generation")
+    if not os.path.exists(file1_name):
+        logger.info(f"{file1_name} does not exist, you need to generate it (see to_fasta)")
     else:
-        print(file1_name, file2_name)
-        to_fasta(sdata, target_key, train_key=train_key, task=task, file_name=name)   
-    print("Fitting model")
-    log_file = open(os.path.join(log_dir, f"{prefix}{name}_fit{suffix}.log"), "w")
+        logger.info(f"Found {file1_name}")
+    if not os.path.exists(file2_name):
+        logger.info(f"{file2_name} does not exist, you need to generate it (see to_fasta)")
+    else:
+        logger.info(f"Found {file2_name}")
+    log_file_path = os.path.join(log_dir, f"{prefix}{name}_fit{suffix}.log")
+    log_file = open(log_file_path, "w")
     process = subprocess.Popen(
         [
             'gkmtrain', 
@@ -165,7 +178,7 @@ def fit(
             '-c', str(regularization_strength), # regularization strength
             '-e', str(epsilon), # epsilon
             '-w', str(positive_weight), # positive weight
-            #'-m', str(cached_mem_size), # cached memory size
+            '-m', str(cached_mem_size), # cached memory size
             '-T', str(threads), # number of threads
             '-v', str(verbose), # verbose
         ],
@@ -177,7 +190,7 @@ def fit(
         err_file = open(os.path.join(log_dir, f"{prefix}{name}_fit{suffix}.err"), "w")
         err_file.write(stderr.decode("utf-8"))
         raise Exception("Error in gkmtrain, check error file: " + os.path.join(log_dir, f"{prefix}{name}_fit{suffix}.err"))
-    print("Model fit, log file saved to", os.path.join(log_dir, f"{prefix}{name}_fit{suffix}.log"))
+    logger.info(f"Model fit, log file saved to {log_file_path}")
     log_file.close()
     return
 
@@ -345,149 +358,3 @@ def explain(
         impscores = np.array([np.array([[float(z) for z in y.split(",")] for y in x.rstrip().split("\t")[2].split(";")]).transpose() for x in open(file, "r")]) # list of np arrays of shape (L, 4) for each sequence
         sdata.uns[f"{file_label}_imps"] = impscores
     return 
-
-
-# Function to generate a gkSVM slurm script
-def generate_slurm_train_script(input_dir,
-                                pos_seqs,
-                                neg_seqs,
-                                val_seqs,
-                                result_dir,
-                                hyperparams,
-                                preprocess,
-                                features="fasta",
-                                architecture="gkmSVM"):
-    if not os.path.exists(result_dir):
-        print("{} does not exist, making dir".format(result_dir))
-        os.makedirs(result_dir)
-
-    # Set up model name
-    task = "clf" if hyperparams.split("-")[0] == "2" else "reg"
-    model = "{}_{}_{}-{}_{}".format(preprocess, features, architecture, task, hyperparams)
-    model_name = os.path.join(result_dir, model)
-
-    # Set up hyperparams
-    hyperparams = hyperparams.split("-")
-    if hyperparams[5] == "True":
-        hyperparams.remove("True")
-        hyperparams = "-y {} -t {} -l {} -k {} -d {} -R -c {} -w {}".format(*hyperparams)
-    else:
-        hyperparams.remove("False")
-        hyperparams = "-y {} -t {} -l {} -k {} -d {} -c {} -w {}".format(*hyperparams)
-
-    # Set up file pointers
-    output = ["#!/bin/bash", "#SBATCH --cpus-per-task=16", "#SBATCH --time=48:00:00",
-              "#SBATCH --partition carter-compute\n"]
-    output += ['date\necho -e "Job ID: $SLURM_JOB_ID\\n"\n']
-    output += ["trainposseqs={}".format(os.path.join(input_dir, pos_seqs)),
-               "trainnegseqs={}".format(os.path.join(input_dir, neg_seqs)),
-               "valseqs={}".format(os.path.join(input_dir, val_seqs)),
-               "resultdir={}".format(result_dir),
-               "modelname={}".format(model_name)]
-    output += ["[ ! -d $resultdir ] && mkdir $resultdir\n"]
-
-    # Set-up training command
-    train_command = "gkmtrain $trainposseqs $trainnegseqs $modelname {} -v 2 -T $SLURM_CPUS_PER_TASK -m 8000.0".format(hyperparams)
-    output += ["echo -e {}".format(train_command)]
-    output += [train_command]
-    output += ['echo -e "\\n"\n']
-
-    # Set up positive train seq predict
-    predict_pos_train_command = 'gkmpredict $trainposseqs $modelname".model.txt" $modelname".train-pos.predict.txt"'
-    output += ["echo -e {}".format(predict_pos_train_command)]
-    output += [predict_pos_train_command]
-    output += ['echo -e "\\n"\n']
-
-    if hyperparams[1] == "2":
-    # Set up negative train seq predict
-        predict_neg_train_command = 'gkmpredict $trainnegseqs $modelname".model.txt" $modelname".train-neg.predict.txt"'
-        output += ["echo -e {}".format(predict_neg_train_command)]
-        output += [predict_neg_train_command]
-        output += ['echo -e "\\n"\n']
-
-    # Set up val seq predict
-    predict_val_command = 'gkmpredict $valseqs $modelname".model.txt" $modelname".test.predict.txt"'
-    output += ["echo -e {}".format(predict_val_command)]
-    output += [predict_val_command]
-    output += ['echo -e "\\n"\n']
-
-    output += ["date\n"]
-
-    # Bash command to edit
-    usage = "Usage: sbatch --job-name=train_{0} -o {1}/train_{0}.out -e {1}/train_{0}.err --mem=20G train_{0}.sh".format(model, result_dir)
-    print(usage)
-    output += [usage]
-
-    # Write to script
-    with open("{}/train_{}.sh".format(result_dir, model), "w") as f:
-        f.write("\n".join(output))
-        print("Successfully generated {}/train_{}.sh".format(result_dir, model))
-
-
-# Function to grab scores from output of gkmtest
-# name => filepath to read from
-def get_scores(fname):
-    f = open(fname)
-    d = [float(x.strip().split('\t')[1]) for x in f]
-    f.close()
-    return d
-
-
-# Function to score test predictions made on the positive and negative classes
-# pos_file => ls-gkm scores for positive test seqs
-# neg_file => ls-gkm scores for negative test seqs
-# thresh => float threshold for accuracy scoring
-def score(pos_file, neg_file, thresh):
-    pos_scores = get_scores(pos_file)
-    neg_scores = get_scores(neg_file)
-    labels = [1]*len(pos_scores) + [0]*len(neg_scores)
-
-    labels_shuf = deepcopy(labels)
-    shuffle(labels_shuf)
-
-    auprc = average_precision_score(labels, pos_scores+neg_scores)
-    auroc = roc_auc_score(labels, pos_scores+neg_scores)
-    auprc_shuf = average_precision_score(labels_shuf, pos_scores+neg_scores)
-    auroc_shuf = roc_auc_score(labels_shuf, pos_scores+neg_scores)
-    acc_thresh0 = sum([x==int(y>thresh) for x,y in zip(labels, pos_scores+neg_scores)])/len(labels)
-    acc_thresh0_shuf = sum([x==int(y>thresh) for x,y in zip(labels_shuf, pos_scores+neg_scores)])/len(labels)
-
-    print("Metric\tValue\tRandomised")
-    print("Accuracy_at_threshold_{}\t{:.4f}\t{:.4f}".format(thresh, acc_thresh0, acc_thresh0_shuf))
-    print("AUROC\t{:.4f}\t{:.4f}".format(auroc, auroc_shuf))
-    print("AUPRC\t{:.4f}\t{:.4f}".format(auprc, auprc_shuf))
-
-
-# Get all the needed information for viz sequence of gkmexplain result. Returns importance
-# scores per position along with the sequences, IDs and one-hot sequences
-def get_gksvm_explain_data(explain_file, fasta_file):
-    impscores = [np.array( [[float(z) for z in y.split(",")] for y in x.rstrip().split("\t")[2].split(";")]) for x in open(explain_file)]
-    fasta_seqs = [x.rstrip() for (i,x) in enumerate(open(fasta_file)) if i%2==1]
-    fasta_ids = [x.rstrip().replace(">", "") for (i,x) in enumerate(open(fasta_file)) if i%2==0]
-    onehot_data = np.array([one_hot_encode_along_channel_axis(x) for x in fasta_seqs])
-    return impscores, fasta_seqs, fasta_ids, onehot_data
-
-
-# Save a list of sequences to separate pos and neg fa files. Must supply target 0 or 1 labels
-def gkmSeq2Fasta(seqs, IDs, ys, name="seqs"):
-    neg_mask = (ys==0)
-
-    neg_seqs, neg_ys, neg_IDs = seqs[neg_mask], ys[neg_mask], IDs[neg_mask]
-    neg_file = open("{}-neg.fa".format(name), "w")
-    for i in range(len(neg_seqs)):
-        neg_file.write(">" + neg_IDs[i] + "\n" + neg_seqs[i] + "\n")
-    neg_file.close()
-
-    pos_seqs, pos_ys, pos_IDs = seqs[~neg_mask], ys[~neg_mask], IDs[~neg_mask]
-    pos_file = open("{}-pos.fa".format(name), "w")
-    for i in range(len(pos_seqs)):
-        pos_file.write(">" + pos_IDs[i] + "\n" + pos_seqs[i] + "\n")
-    pos_file.close()
-
-
-# Save a list of sequences to fasta
-def seq2Fasta(seqs, IDs, name="seqs"):
-    file = open("{}.fa".format(name), "w")
-    for i in range(len(seqs)):
-        file.write(">" + IDs[i] + "\n" + seqs[i] + "\n")
-    file.close()
